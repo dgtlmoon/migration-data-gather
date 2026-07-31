@@ -11,6 +11,77 @@ load_dotenv()
 # Set your Stripe API key from the environment variable
 stripe.api_key = os.getenv('STRIPE_API_KEY')
 
+def get_first_subscription_item(subscription):
+    items = subscription['items'].data
+    return items[0] if items else None
+
+def get_current_period_timestamps(subscription):
+    """Stripe API >= 2025-03 moved billing periods from Subscription to SubscriptionItem."""
+    first_item = get_first_subscription_item(subscription)
+    period_start = getattr(first_item, 'current_period_start', None) if first_item else None
+    period_end = getattr(first_item, 'current_period_end', None) if first_item else None
+    period_start = period_start or getattr(subscription, 'current_period_start', None)
+    period_end = period_end or getattr(subscription, 'current_period_end', None)
+    return period_start, period_end
+
+def get_billing_interval(subscription):
+    first_item = get_first_subscription_item(subscription)
+    if first_item and first_item.price and first_item.price.recurring:
+        return first_item.price.recurring.interval, first_item.price.recurring.interval_count
+
+    plan = getattr(subscription, 'plan', None)
+    if plan:
+        return plan.interval, plan.interval_count
+
+    return 'month', 1
+
+def get_subscription_discount(subscription):
+    """Return the primary discount (Paddle supports one discount per subscription)."""
+    discount = getattr(subscription, 'discount', None)
+    if discount:
+        return discount
+
+    subscription_discounts = getattr(subscription, 'discounts', None) or []
+    if subscription_discounts:
+        return subscription_discounts[0]
+
+    for item in subscription['items'].data:
+        item_discounts = getattr(item, 'discounts', None) or []
+        if item_discounts:
+            return item_discounts[0]
+
+    return None
+
+_coupon_cache = {}
+
+def get_discount_coupon(discount):
+    """Resolve coupon from legacy and Basil API discount shapes."""
+    coupon = getattr(discount, 'coupon', None)
+    if coupon and not isinstance(coupon, str):
+        return coupon
+
+    source = getattr(discount, 'source', None)
+    if not source or getattr(source, 'type', None) != 'coupon':
+        return None
+
+    coupon_id = source.coupon
+    if not isinstance(coupon_id, str):
+        return coupon_id
+
+    if coupon_id not in _coupon_cache:
+        try:
+            _coupon_cache[coupon_id] = stripe.Coupon.retrieve(coupon_id)
+        except stripe.error.StripeError as e:
+            print(f"Error fetching coupon {coupon_id}: {e}")
+            return None
+
+    return _coupon_cache[coupon_id]
+
+def format_timestamp(timestamp):
+    if not timestamp:
+        return ''
+    return datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%dT%H:%M:%SZ')
+
 # Function to fetch card token with backoff logic
 def fetch_card_token(customer_id):
     while True:
@@ -47,26 +118,26 @@ def fetch_tax_id(customer_id):
 
 # Function to calculate remaining discount cycles
 def calculate_remaining_discount_cycles(subscription):
-    if not subscription.discount:
+    discount = get_subscription_discount(subscription)
+    if not discount:
         return '', ''  # No discount applied
-    
-    discount = subscription.discount
-    coupon = discount.coupon
+
+    coupon = get_discount_coupon(discount)
+    if not coupon:
+        return discount.id, ''
+
     discount_start = datetime.utcfromtimestamp(discount.start)
-    
-    # Get the subscription's billing interval (e.g., 'month', 'year')
-    billing_interval = subscription.plan.interval
-    billing_interval_count = subscription.plan.interval_count  # e.g., 1 for monthly, 12 for yearly
+    billing_interval, billing_interval_count = get_billing_interval(subscription)
 
     # Check if the discount is repeating or once
     if coupon.duration == 'forever':
         return discount.id, '∞'  # No remaining cycles limit for forever discounts
-    
+
     total_cycles = coupon.duration_in_months if coupon.duration == 'repeating' else 1
-    
+
     # Calculate the number of billing cycles that have passed since the discount started
     current_date = datetime.utcnow()
-    
+
     if billing_interval == 'month':
         cycles_used = (current_date.year - discount_start.year) * 12 + (current_date.month - discount_start.month)
     elif billing_interval == 'year':
@@ -75,12 +146,12 @@ def calculate_remaining_discount_cycles(subscription):
         # Handle other intervals like 'week', etc., if applicable
         billing_days = billing_interval_count * 7 if billing_interval == 'week' else billing_interval_count
         cycles_used = (current_date - discount_start).days // billing_days
-    
+
     # Calculate remaining cycles
     remaining_cycles = total_cycles - cycles_used
     if remaining_cycles < 0:
         remaining_cycles = 0  # Ensure it doesn't go negative
-    
+
     return discount.id, remaining_cycles  # Return discount ID and remaining cycles
 
 # Function to fetch subscription and customer data from Stripe
@@ -89,7 +160,7 @@ def fetch_stripe_subscriptions(limit=100):
     
     try:
         # Expand both 'customer' and 'items.data' in the subscription list call
-        subscriptions = stripe.Subscription.list(limit=limit, expand=["data.customer", "data.discount.coupon", "data.items.data.price"])
+        subscriptions = stripe.Subscription.list(limit=limit, expand=["data.customer", "data.items.data.price", "data.items.data.discounts"])
         
         for subscription in subscriptions.auto_paging_iter():
             # Skip subscriptions with status "past_due"
@@ -105,9 +176,10 @@ def fetch_stripe_subscriptions(limit=100):
             address_city = customer.address.city if customer.address else ''
             address_region = customer.address.state if customer.address else ''
 
-            current_period_started_at = datetime.utcfromtimestamp(subscription.current_period_start).strftime('%Y-%m-%dT%H:%M:%SZ') if subscription.current_period_start else ''
-            current_period_ends_at = datetime.utcfromtimestamp(subscription.current_period_end).strftime('%Y-%m-%dT%H:%M:%SZ') if subscription.current_period_end else ''
-            started_at = datetime.utcfromtimestamp(subscription.start_date).strftime('%Y-%m-%dT%H:%M:%SZ') if subscription.start_date else ''
+            period_start, period_end = get_current_period_timestamps(subscription)
+            current_period_started_at = format_timestamp(period_start)
+            current_period_ends_at = format_timestamp(period_end)
+            started_at = format_timestamp(subscription.start_date)
 
             card_token = fetch_card_token(customer.id)
             business_tax_identifier = fetch_tax_id(customer.id)

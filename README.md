@@ -114,14 +114,17 @@ This 4-column CSV file should be filled out by the seller to contain the referen
 - `stripe_discount_id`: Stripe discount ID.
 - `paddle_discount_id`: Equivalent Paddle discount ID.
 
+The price columns and the discount columns are independent lists, so it is normal for a row to fill in only one pair — you will usually have a different number of prices and discounts. What you must not do is fill in one half of a pair: a row with a `paddle_price_id` but no `stripe_price_id` is a data-entry mistake, and the script warns and ignores that row rather than applying the value to every blank cell in the export.
+
 ### prices-discounts-mapping.py
 
 This script maps Stripe price and discount IDs to Paddle price and discount IDs using a reference CSV file.
 
 #### Key Functions:
-- `load_mapping(file_path, key_column, value_column)`: Loads the mapping from a CSV file.
-- `map_prices(rows, price_mapping)`: Maps Stripe price IDs to Paddle price IDs.
-- `map_discounts(rows, discount_mapping)`: Maps Stripe discount IDs to Paddle discount IDs.
+- `load_mapping(file_path, key_column, value_column)`: Loads the mapping from a CSV file, skipping blank and half-filled rows.
+- `map_prices(rows, price_mapping)`: Maps Stripe price IDs to Paddle price IDs. Returns the number replaced and any IDs with no mapping.
+- `map_discounts(rows, discount_mapping)`: Maps Stripe discount IDs to Paddle discount IDs. Returns the number replaced and any IDs with no mapping.
+- `report(label, mapped, unmapped)`: Prints how many values were replaced and lists anything left unmapped.
 - `main()`: Orchestrates the script execution.
 
 #### Usage:
@@ -134,6 +137,7 @@ This script maps Stripe price and discount IDs to Paddle price and discount IDs 
    ```
 3. You will be asked if you want to map prices, followed by discounts. This gives you the option to use the script to map e.g. only discounts, if you had previously mapped only prices. 
 4. The script will generate a CSV file named `paddle_migration_output_mapped.csv` with the mapped data.
+5. Read the warnings. Any Stripe ID with no entry in the reference file is listed and left untouched in the output — those rows will be rejected at import, so either add them to the reference file and re-run, or fix them by hand.
 
 ## After Running Both Scripts Successfully
 

@@ -3,6 +3,7 @@ import stripe
 import csv
 import sys
 import time
+from collections import Counter
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -70,11 +71,11 @@ def get_discount_coupon(discount):
         return coupon_id
 
     if coupon_id not in _coupon_cache:
-        try:
-            _coupon_cache[coupon_id] = stripe.Coupon.retrieve(coupon_id)
-        except stripe.error.StripeError as e:
-            print(f"Error fetching coupon {coupon_id}: {e}")
+        coupon = fetch_with_backoff(lambda: stripe.Coupon.retrieve(coupon_id),
+                                    f"fetching coupon {coupon_id}")
+        if coupon is None:
             return None
+        _coupon_cache[coupon_id] = coupon
 
     return _coupon_cache[coupon_id]
 
@@ -82,6 +83,25 @@ def format_timestamp(timestamp):
     if not timestamp:
         return ''
     return datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+MAX_RATE_LIMIT_RETRIES = 6
+
+# Helper to retry a read with capped exponential backoff
+def fetch_with_backoff(call, description):
+    """Retry on 429 with exponential backoff, then give up rather than hang forever."""
+    for attempt in range(MAX_RATE_LIMIT_RETRIES):
+        try:
+            return call()
+        except stripe.error.StripeError as e:
+            if e.http_status == 429 and attempt < MAX_RATE_LIMIT_RETRIES - 1:
+                delay = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
+                print(f"Rate limit exceeded while {description}. Retrying in {delay} seconds...")
+                time.sleep(delay)
+                continue
+            print(f"Error {description}: {e}")
+            return None
+    return None
+
 
 # Rows whose card_token needs a human look, reported at the end of the run
 _card_token_fallbacks = []
@@ -96,19 +116,10 @@ def _newest_card_id(customer_id):
     if customer_id in _newest_card_cache:
         return _newest_card_cache[customer_id]
 
-    newest = ''
-    while True:
-        try:
-            payment_methods = stripe.PaymentMethod.list(customer=customer_id, type="card")
-            newest = payment_methods.data[0].id if payment_methods.data else ''
-            break
-        except stripe.error.StripeError as e:
-            if e.http_status == 429:  # Rate limit exceeded
-                print(f"Rate limit exceeded while fetching payment methods for customer {customer_id}. Retrying in 2 seconds...")
-                time.sleep(2)  # Wait for 2 seconds before retrying
-                continue
-            print(f"Error fetching payment methods for customer {customer_id}: {e}")
-            break
+    payment_methods = fetch_with_backoff(
+        lambda: stripe.PaymentMethod.list(customer=customer_id, type="card"),
+        f"fetching payment methods for customer {customer_id}")
+    newest = payment_methods.data[0].id if payment_methods and payment_methods.data else ''
 
     _newest_card_cache[customer_id] = newest
     return newest
@@ -153,20 +164,12 @@ def fetch_card_token(subscription, customer):
 
 # Function to fetch tax ID with backoff logic
 def fetch_tax_id(customer_id):
-    while True:
-        try:
-            tax_ids = stripe.Customer.list_tax_ids(customer_id)
-            if tax_ids.data:
-                return tax_ids.data[0].value
-            else:
-                return ''
-        except stripe.error.StripeError as e:
-            if e.http_status == 429:  # Rate limit exceeded
-                print(f"Rate limit exceeded while fetching tax ID for customer {customer_id}. Retrying in 2 seconds...")
-                time.sleep(2)  # Wait for 2 seconds before retrying
-                continue
-            print(f"Error fetching tax ID for customer {customer_id}: {e}")
-            return ''
+    tax_ids = fetch_with_backoff(
+        lambda: stripe.Customer.list_tax_ids(customer_id),
+        f"fetching tax ID for customer {customer_id}")
+    if tax_ids and tax_ids.data:
+        return tax_ids.data[0].value
+    return ''
 
 # Function to calculate remaining discount cycles
 def calculate_remaining_discount_cycles(subscription):
@@ -210,6 +213,10 @@ def calculate_remaining_discount_cycles(subscription):
         remaining_cycles = 0  # Ensure it doesn't go negative
 
     return discount.id, remaining_cycles  # Return discount ID and remaining cycles
+
+# Statuses Paddle accepts on import. Stripe can also report incomplete,
+# incomplete_expired and unpaid, which need a decision from the seller.
+PADDLE_SUPPORTED_STATUSES = {'active', 'trialing', 'past_due', 'paused', 'canceled'}
 
 # Function to fetch subscription and customer data from Stripe
 def fetch_stripe_subscriptions(limit=100):
@@ -363,6 +370,14 @@ def fetch_stripe_subscriptions(limit=100):
         if len(_card_token_mismatches) > 20:
             print(f"  ... and {len(_card_token_mismatches) - 20} more")
 
+    unsupported = Counter(row['status'] for row in subscriptions_with_customers
+                          if row['status'] not in PADDLE_SUPPORTED_STATUSES)
+    if unsupported:
+        print("Warning: the following Stripe statuses are not accepted by Paddle and have been "
+              "exported as-is. Decide what to do with these rows before importing:")
+        for status, count in sorted(unsupported.items()):
+            print(f"  {status}: {count} subscription(s)")
+
     return subscriptions_with_customers
 
 # Function to export data to CSV
@@ -390,7 +405,7 @@ def export_to_csv(data, file_path='paddle_migration_output.csv'):
         headers.append(f'price_id_{i}')
         headers.append(f'quantity_{i}')
     
-    with open(file_path, 'w', newline='') as csvfile:
+    with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=headers)
         writer.writeheader()
         for row in data:
@@ -398,6 +413,11 @@ def export_to_csv(data, file_path='paddle_migration_output.csv'):
 
 # Main function to orchestrate the script
 def main():
+    if not stripe.api_key:
+        print("STRIPE_API_KEY is not set. Create a .env file in this folder containing "
+              "STRIPE_API_KEY='rk_live_...' - see the README for the permissions it needs.")
+        sys.exit(1)
+
     try:
         subscriptions_data = fetch_stripe_subscriptions(limit=100)
     except RuntimeError as e:

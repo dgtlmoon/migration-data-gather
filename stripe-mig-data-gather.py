@@ -157,14 +157,19 @@ def calculate_remaining_discount_cycles(subscription):
 # Function to fetch subscription and customer data from Stripe
 def fetch_stripe_subscriptions(limit=100):
     subscriptions_with_customers = []
+    past_due_subscriptions = []
     
     try:
         # Expand both 'customer' and 'items.data' in the subscription list call
         subscriptions = stripe.Subscription.list(limit=limit, expand=["data.customer", "data.items.data.price", "data.items.data.discounts"])
         
         for subscription in subscriptions.auto_paging_iter():
-            # Skip subscriptions with status "past_due"
+            # Paddle does not support migrating past_due subscriptions from an external
+            # provider, so they are left out. Record them rather than dropping them
+            # silently: an export that is quietly short of subscribers looks exactly like
+            # a complete one.
             if subscription.status == 'past_due':
+                past_due_subscriptions.append(subscription.id)
                 continue
 
             customer = subscription.customer
@@ -279,7 +284,16 @@ def fetch_stripe_subscriptions(limit=100):
     
     except stripe.error.StripeError as e:
         print(f"Error fetching data from Stripe: {e}")
-    
+
+    if past_due_subscriptions:
+        print(f"{len(past_due_subscriptions)} past_due subscription(s) were left out of the export. "
+              f"Paddle does not support migrating these from an external provider: follow up with a "
+              f"separate migration once dunning has finished and they are active again.")
+        for subscription_id in past_due_subscriptions[:20]:
+            print(f"  {subscription_id}")
+        if len(past_due_subscriptions) > 20:
+            print(f"  ... and {len(past_due_subscriptions) - 20} more")
+
     return subscriptions_with_customers
 
 # Function to export data to CSV

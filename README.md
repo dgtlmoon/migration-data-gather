@@ -124,6 +124,17 @@ This script fetches subscription and customer data from the Stripe API and expor
 #### Note:
 Subscription statuses are exported exactly as Stripe reports them. Paddle accepts `active`, `trialing`, `past_due`, `paused` and `canceled`; if your account has subscriptions in `incomplete`, `incomplete_expired` or `unpaid`, the script prints a count per status at the end of the run and leaves the rows in place for you to decide on.
 
+#### Past due subscriptions:
+Subscriptions in Stripe's `past_due` status are **left out of the export**, and the script now lists their IDs at the end of the run so you know who was excluded.
+
+Paddle does not support migrating `past_due` subscriptions from an external provider. From a Paddle Solutions Engineer, when asked about this directly:
+
+> We can't migrate past_due subs - the doc you're looking at is based on Paddle Classic to Paddle Billing migration, which is very different from third party MoRs or PSPs migrating into Paddle. We don't support migrating past_due as standard from external providers.
+
+The document referred to is the [Paddle Classic to Paddle Billing porting guide](https://developer.paddle.com/migrate/paddle-classic/port-subscriptions), which states that *"You can migrate active, paused, as well as past due subscriptions"*. That applies to Classic-to-Billing only. It does **not** apply to a Stripe (or other third-party PSP/MoR) migration, so don't rely on it when planning this export.
+
+Wait for dunning to finish on those subscriptions, then follow up with a separate migration for the ones that become active again. The list printed at the end of the run is what you need for that follow-up.
+
 #### Note:
 The script will return a number of columns where the data requested by Paddle is not readily available in the Stripe API. In these cases, explanatory values are provided in each column in the outputted CSV. Follow the instructions in the columns to obtain the necessary values from other sources and/or delete these columns as appropriate.
 

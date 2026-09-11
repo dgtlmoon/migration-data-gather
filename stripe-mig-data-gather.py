@@ -226,6 +226,7 @@ PADDLE_SUPPORTED_STATUSES = {'active', 'trialing', 'past_due', 'paused', 'cancel
 # Function to fetch subscription and customer data from Stripe
 def fetch_stripe_subscriptions(limit=100):
     subscriptions_with_customers = []
+    past_due_subscriptions = []
     
     try:
         # Expand both 'customer' and 'items.data' in the subscription list call
@@ -237,8 +238,12 @@ def fetch_stripe_subscriptions(limit=100):
         )
         
         for subscription in subscriptions.auto_paging_iter():
-            # Skip subscriptions with status "past_due"
+            # Paddle does not support migrating past_due subscriptions from an external
+            # provider, so they are left out. Record them rather than dropping them
+            # silently: an export that is quietly short of subscribers looks exactly like
+            # a complete one.
             if subscription.status == 'past_due':
+                past_due_subscriptions.append(subscription.id)
                 continue
 
             customer = subscription.customer
@@ -382,6 +387,15 @@ def fetch_stripe_subscriptions(limit=100):
               "exported as-is. Decide what to do with these rows before importing:")
         for status, count in sorted(unsupported.items()):
             print(f"  {status}: {count} subscription(s)")
+
+    if past_due_subscriptions:
+        print(f"{len(past_due_subscriptions)} past_due subscription(s) were left out of the export. "
+              f"Paddle does not support migrating these from an external provider: follow up with a "
+              f"separate migration once dunning has finished and they are active again.")
+        for subscription_id in past_due_subscriptions[:20]:
+            print(f"  {subscription_id}")
+        if len(past_due_subscriptions) > 20:
+            print(f"  ... and {len(past_due_subscriptions) - 20} more")
 
     return subscriptions_with_customers
 

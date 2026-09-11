@@ -94,6 +94,15 @@ This script fetches subscription and customer data from the Stripe API and expor
    ```
 3. The script will generate a CSV file named `paddle_migration_output.csv` with the fetched data.
 
+#### Past due subscriptions:
+Subscriptions in Stripe's `past_due` status are **included in the export by default**, and the script prints their IDs at the end of the run. These are customers mid-dunning rather than lapsed customers, and Paddle's [porting documentation](https://developer.paddle.com/migrate/paddle-classic/port-subscriptions) states that *"You can migrate active, paused, as well as past due subscriptions"* — subscriptions still in their dunning retries have the process restarted after migration, and ones past their final dunning attempt are imported as `paused`.
+
+That documentation covers Paddle Classic to Paddle Billing rather than a CSV import, so confirm the handling with your Solutions Engineer. To leave them out and migrate them separately once dunning has finished:
+
+```sh
+SKIP_PAST_DUE=1 python3 stripe-mig-data-gather.py
+```
+
 #### Note:
 The script will return a number of columns where the data requested by Paddle is not readily available in the Stripe API. In these cases, explanatory values are provided in each column in the outputted CSV. Follow the instructions in the columns to obtain the necessary values from other sources and/or delete these columns as appropriate.
 

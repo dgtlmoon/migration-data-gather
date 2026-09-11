@@ -154,18 +154,28 @@ def calculate_remaining_discount_cycles(subscription):
 
     return discount.id, remaining_cycles  # Return discount ID and remaining cycles
 
+# past_due subscriptions are customers mid-dunning, not lapsed ones. Paddle's porting
+# documentation says they can be migrated - subscriptions still in their dunning retries
+# restart those retries after migration, and ones past their final attempt import as
+# paused - so they are exported by default. Set SKIP_PAST_DUE=1 to leave them out and
+# migrate them separately once dunning has finished.
+SKIP_PAST_DUE = os.getenv('SKIP_PAST_DUE', '').lower() in ('1', 'true', 'yes')
+
 # Function to fetch subscription and customer data from Stripe
 def fetch_stripe_subscriptions(limit=100):
     subscriptions_with_customers = []
+    past_due_subscriptions = []
     
     try:
         # Expand both 'customer' and 'items.data' in the subscription list call
         subscriptions = stripe.Subscription.list(limit=limit, expand=["data.customer", "data.items.data.price", "data.items.data.discounts"])
         
         for subscription in subscriptions.auto_paging_iter():
-            # Skip subscriptions with status "past_due"
+            # Subscriptions with status "past_due" are included unless SKIP_PAST_DUE is set
             if subscription.status == 'past_due':
-                continue
+                past_due_subscriptions.append(subscription.id)
+                if SKIP_PAST_DUE:
+                    continue
 
             customer = subscription.customer
 
@@ -279,7 +289,21 @@ def fetch_stripe_subscriptions(limit=100):
     
     except stripe.error.StripeError as e:
         print(f"Error fetching data from Stripe: {e}")
-    
+
+    if past_due_subscriptions:
+        if SKIP_PAST_DUE:
+            print(f"{len(past_due_subscriptions)} past_due subscription(s) were left out of the export "
+                  f"because SKIP_PAST_DUE is set. They are customers mid-dunning: migrate them separately "
+                  f"once dunning has finished, or re-run without SKIP_PAST_DUE to include them.")
+        else:
+            print(f"{len(past_due_subscriptions)} past_due subscription(s) are included in the export. "
+                  f"Confirm with your Solutions Engineer how Paddle should treat them, or set "
+                  f"SKIP_PAST_DUE=1 to leave them out and migrate them later.")
+        for subscription_id in past_due_subscriptions[:20]:
+            print(f"  {subscription_id}")
+        if len(past_due_subscriptions) > 20:
+            print(f"  ... and {len(past_due_subscriptions) - 20} more")
+
     return subscriptions_with_customers
 
 # Function to export data to CSV

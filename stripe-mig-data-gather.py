@@ -176,6 +176,18 @@ def fetch_tax_id(customer_id):
         return tax_ids.data[0].value
     return ''
 
+# A coupon's duration is always expressed in months, but Paddle wants a number of
+# billing cycles, so the two are converted to a common unit before being compared.
+_MONTHS_PER_INTERVAL = {'month': 1, 'year': 12}
+_DAYS_PER_INTERVAL = {'day': 1, 'week': 7}
+_DAYS_PER_MONTH = 30.44  # average, only used when billing by day or week
+
+def _months_elapsed(start, now):
+    months = (now.year - start.year) * 12 + (now.month - start.month)
+    if now.day < start.day:
+        months -= 1
+    return max(months, 0)
+
 # Function to calculate remaining discount cycles
 def calculate_remaining_discount_cycles(subscription):
     discount = get_subscription_discount(subscription)
@@ -191,33 +203,39 @@ def calculate_remaining_discount_cycles(subscription):
     if not coupon:
         return discount.id, ''
 
+    # Paddle reads this column as a number, so a forever discount is exported blank
+    # rather than as a placeholder.
+    if coupon.duration == 'forever':
+        return discount.id, ''
+
+    # A 'once' coupon only ever covers the first invoice, which Stripe has already issued.
+    if coupon.duration != 'repeating':
+        return discount.id, 0
+
+    duration_in_months = coupon.duration_in_months
+    if not duration_in_months:
+        return discount.id, ''
+
     discount_start = datetime.fromtimestamp(discount.start, timezone.utc)
+    current_date = datetime.now(timezone.utc)
     billing_interval, billing_interval_count = get_billing_interval(subscription)
 
-    # Check if the discount is repeating or once
-    if coupon.duration == 'forever':
-        return discount.id, '∞'  # No remaining cycles limit for forever discounts
-
-    total_cycles = coupon.duration_in_months if coupon.duration == 'repeating' else 1
-
-    # Calculate the number of billing cycles that have passed since the discount started
-    current_date = datetime.now(timezone.utc)
-
-    if billing_interval == 'month':
-        cycles_used = (current_date.year - discount_start.year) * 12 + (current_date.month - discount_start.month)
-    elif billing_interval == 'year':
-        cycles_used = current_date.year - discount_start.year
+    if billing_interval in _MONTHS_PER_INTERVAL:
+        cycle_length = _MONTHS_PER_INTERVAL[billing_interval] * billing_interval_count
+        discount_length = duration_in_months
+        elapsed = _months_elapsed(discount_start, current_date)
     else:
-        # Handle other intervals like 'week', etc., if applicable
-        billing_days = billing_interval_count * 7 if billing_interval == 'week' else billing_interval_count
-        cycles_used = (current_date - discount_start).days // billing_days
+        cycle_length = _DAYS_PER_INTERVAL.get(billing_interval, 1) * billing_interval_count
+        discount_length = duration_in_months * _DAYS_PER_MONTH
+        elapsed = max((current_date - discount_start).days, 0)
 
-    # Calculate remaining cycles
-    remaining_cycles = total_cycles - cycles_used
-    if remaining_cycles < 0:
-        remaining_cycles = 0  # Ensure it doesn't go negative
+    # Discounted invoices fall at 0, cycle_length, 2 * cycle_length ... for as long as the
+    # coupon runs. Report only the ones still to come: the current period has already been
+    # invoiced by Stripe.
+    total_invoices = int((discount_length - 1) // cycle_length) + 1
+    issued_invoices = int(elapsed // cycle_length) + 1
 
-    return discount.id, remaining_cycles  # Return discount ID and remaining cycles
+    return discount.id, max(total_invoices - issued_invoices, 0)
 
 # Statuses Paddle accepts on import. Stripe can also report incomplete,
 # incomplete_expired and unpaid, which need a decision from the seller.

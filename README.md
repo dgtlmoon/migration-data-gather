@@ -17,11 +17,51 @@ This collection of scripts  is designed to gather subscription and customer data
 ## Prerequisites
 
 - Python 3.x
-- Stripe API key
+- Stripe API key — see [Stripe API Key Permissions](#stripe-api-key-permissions) below for which permissions to grant
 - `.env` file with the Stripe API key:
   ```
   STRIPE_API_KEY=your_stripe_api_key
   ```
+
+## Stripe API Key Permissions
+
+### Use a dedicated key for the migration
+
+Don't reuse an existing application/secret key for this. Create a **restricted API key** (starts with `rk_live_`) in the Stripe Dashboard under [Developers > API keys](https://dashboard.stripe.com/apikeys) > **Create restricted key**, named something obvious like `paddle-migration-export`, and give it **only the read permissions listed below**. A dedicated key means:
+
+- The key can only read data — it can never create charges, refunds, or modify your subscribers, even if it leaks.
+- You can see exactly which API calls this migration made via **⋯ > View request logs** on that key.
+- You can **expire the key** the moment the migration data has been handed over, without affecting anything else you run.
+
+Start from "no permissions" rather than a preset, set everything to **None**, then switch on only the resources below. **Write access is not needed anywhere** — both scripts are read-only against Stripe.
+
+Optionally, attach an [access policy](https://dashboard.stripe.com/api-access-policies) to the key restricting it to the IP address you run the export from.
+
+### Permissions to enable (all **Read**)
+
+| Permission (Dashboard resource) | Level | Why it's needed |
+| --- | --- | --- |
+| **Subscriptions** | Read | `GET /v1/subscriptions` — the main listing that drives the whole export. |
+| **Customers** | Read | Customer is expanded on each subscription (email, name, address), and `GET /v1/customers/{id}/tax_ids` provides `business_tax_identifier`. |
+| **Prices** | Read | Subscription items expand `price`, used for `price_id_N` and the billing interval. |
+| **Payment Methods** | Read | `GET /v1/payment_methods?customer=...&type=card` provides the `card_token` column. |
+| **Coupons** | Read | `GET /v1/coupons/{id}` resolves coupon duration for `discount_remaining_cycles`. |
+
+Notes:
+
+- Permission names and groupings differ slightly between Dashboard versions (for example, **Prices** may sit under the Billing group, **Payment Methods** under Core). If a call fails, Stripe returns a `403` whose error message names the exact permission to add — and you can check the key's request logs to see which endpoint was rejected.
+- Customer tax IDs are covered by **Customers: Read**. If your Dashboard exposes a separate **Tax IDs** resource, enable that as Read too.
+- `prices-discounts-mapping.py` does not talk to Stripe at all — it only reads the CSV files — so it needs no key.
+
+### Live mode vs sandbox
+
+The data you migrate is live data, so the key must be a **live mode** key. If you want to dry-run the scripts first, create the equivalent restricted key in a sandbox and run against that before switching.
+
+### After the migration
+
+1. Expire or rotate the key (**⋯ > Expire key** on the API keys page).
+2. Delete the local `.env` file, and make sure `.env` was never committed — add it to `.gitignore` before your first run.
+3. The generated CSVs contain customer PII (emails, names, addresses, tax IDs). Keep them out of version control and share them only with your Paddle Solutions Engineer.
 
 ## Installation
 

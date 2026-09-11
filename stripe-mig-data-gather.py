@@ -223,10 +223,24 @@ def calculate_remaining_discount_cycles(subscription):
 # incomplete_expired and unpaid, which need a decision from the seller.
 PADDLE_SUPPORTED_STATUSES = {'active', 'trialing', 'past_due', 'paused', 'canceled'}
 
+# Function to count subscriptions up front so progress can be reported as "n of total"
+def count_subscriptions(limit=100):
+    """Cheap pre-pass: pages of IDs only, no expands, ~1 request per 100 subscriptions."""
+    print("Counting subscriptions...", flush=True)
+    try:
+        total = sum(1 for _ in stripe.Subscription.list(limit=limit).auto_paging_iter())
+    except stripe.error.StripeError as e:
+        print(f"Could not count subscriptions up front ({e}); progress will be shown without a total.")
+        return None
+    print(f"Found {total} subscription(s) to process.", flush=True)
+    return total
+
 # Function to fetch subscription and customer data from Stripe
 def fetch_stripe_subscriptions(limit=100):
     subscriptions_with_customers = []
     past_due_subscriptions = []
+    total = count_subscriptions(limit)
+    progress_total = total if total is not None else '?'
     
     try:
         # Expand both 'customer' and 'items.data' in the subscription list call
@@ -237,13 +251,18 @@ def fetch_stripe_subscriptions(limit=100):
             expand=["data.customer", "data.items.data.price", "data.items.data.discounts", "data.discounts"],
         )
         
-        for subscription in subscriptions.auto_paging_iter():
+        for index, subscription in enumerate(subscriptions.auto_paging_iter(), start=1):
+            # Each subscription costs a couple of API calls, so report progress as we go -
+            # without this the script looks hung for the whole run.
+            print(f"[{index}/{progress_total}] {subscription.id} ({subscription.status})", flush=True)
+
             # Paddle does not support migrating past_due subscriptions from an external
             # provider, so they are left out. Record them rather than dropping them
             # silently: an export that is quietly short of subscribers looks exactly like
             # a complete one.
             if subscription.status == 'past_due':
                 past_due_subscriptions.append(subscription.id)
+                print(f"  skipped: past_due", flush=True)
                 continue
 
             customer = subscription.customer
@@ -432,6 +451,8 @@ def export_to_csv(data, file_path='paddle_migration_output.csv'):
 
 # Main function to orchestrate the script
 def main():
+    print(f"Stripe API version {stripe.api_version}", flush=True)
+
     if not stripe.api_key:
         print("STRIPE_API_KEY is not set. Create a .env file in this folder containing "
               "STRIPE_API_KEY='rk_live_...' - see the README for the permissions it needs.")

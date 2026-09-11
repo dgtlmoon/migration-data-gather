@@ -102,6 +102,7 @@ Set `STRIPE_API_VERSION` in your `.env` if you need to export against a differen
 This script fetches subscription and customer data from the Stripe API and exports it to a CSV file.
 
 #### Key Functions:
+- `count_subscriptions(limit)`: Counts subscriptions up front so progress can be reported as "n of total".
 - `fetch_stripe_subscriptions(limit)`: Fetches subscription and customer data from Stripe.
 - `fetch_with_backoff(call, description)`: Runs a Stripe read, retrying rate-limited requests with capped exponential backoff.
 - `fetch_card_token(subscription, customer)`: Returns the payment method Stripe bills the subscription with, checking the subscription default, the subscription source, the customer's invoice default and the customer source in that order, and falling back to the customer's most recently created card.
@@ -117,7 +118,18 @@ This script fetches subscription and customer data from the Stripe API and expor
    ```sh
    python3 stripe-mig-data-gather.py
    ```
-3. The script will generate a CSV file named `paddle_migration_output.csv` with the fetched data.
+3. The script prints a line per subscription as it works, because each one costs a couple of API calls and a large account takes a while:
+
+   ```
+   Stripe API version 2025-08-27.basil
+   Counting subscriptions...
+   Found 90 subscription(s) to process.
+   [1/90] sub_1Abc... (active)
+   [2/90] sub_1Def... (past_due)
+     skipped: past_due
+   ```
+
+4. The script will generate a CSV file named `paddle_migration_output.csv` with the fetched data.
 
    If Stripe returns an error part-way through, the script aborts with a non-zero exit code and writes no CSV, so a truncated subscriber list can never be mistaken for a complete export. Fix the error and re-run.
 

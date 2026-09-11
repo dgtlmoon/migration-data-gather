@@ -1,0 +1,12 @@
+# Stripe credentials
+.env
+
+# Export output - contains customer PII (emails, names, addresses, tax IDs)
+paddle_migration_output.csv
+paddle_migration_output_mapped.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

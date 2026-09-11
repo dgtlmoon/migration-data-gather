@@ -79,6 +79,7 @@ This script fetches subscription and customer data from the Stripe API and expor
 
 #### Key Functions:
 - `fetch_stripe_subscriptions(limit)`: Fetches subscription and customer data from Stripe.
+- `fetch_with_backoff(call, description)`: Runs a Stripe read, retrying rate-limited requests with capped exponential backoff.
 - `fetch_card_token(subscription, customer)`: Returns the payment method Stripe bills the subscription with, checking the subscription default, the subscription source, the customer's invoice default and the customer source in that order, and falling back to the customer's most recently created card.
 - `fetch_tax_id(customer_id)`: Fetches the tax ID for a given customer.
 - `calculate_remaining_discount_cycles(subscription)`: Calculates the remaining discount cycles for a subscription.
@@ -95,6 +96,9 @@ This script fetches subscription and customer data from the Stripe API and expor
 3. The script will generate a CSV file named `paddle_migration_output.csv` with the fetched data.
 
    If Stripe returns an error part-way through, the script aborts with a non-zero exit code and writes no CSV, so a truncated subscriber list can never be mistaken for a complete export. Fix the error and re-run.
+
+#### Note:
+Subscription statuses are exported exactly as Stripe reports them. Paddle accepts `active`, `trialing`, `past_due`, `paused` and `canceled`; if your account has subscriptions in `incomplete`, `incomplete_expired` or `unpaid`, the script prints a count per status at the end of the run and leaves the rows in place for you to decide on.
 
 #### Note:
 The script will return a number of columns where the data requested by Paddle is not readily available in the Stripe API. In these cases, explanatory values are provided in each column in the outputted CSV. Follow the instructions in the columns to obtain the necessary values from other sources and/or delete these columns as appropriate.
@@ -150,6 +154,7 @@ This script maps Stripe price and discount IDs to Paddle price and discount IDs 
 - `purchase_order_number` column in the Paddle migration CSV - there is no specific field for this in Stripe. You may be storing this as custom data. You should update the script to pull the desired value here.
 - `additional_information` column in the Paddle migration CSV - the corresponding value may be found the “description” value in the Stripe Invoice API. Check and include if necessary.
 - `payment_terms_interval` column in the Paddle migration - the Stripe API appears to assume “day” in every case. “day” is automatically used here. Update this if you have terms not measured in days.
+- Rate-limited requests are retried up to 6 times with exponential backoff (1, 2, 4, 8, 16 seconds). If Stripe is still rate limiting after that, the affected value is exported blank and the error is printed — check the log before submitting the file.
 - The script pulls in Stripe discount IDs. You’ll need to map these against the equivalent discount_id’s you have created in Paddle before sharing the file for import. You should also check that the `discount_remaining_cycles` match your expectation.
 - `card_token` follows Stripe's own billing precedence: the subscription's `default_payment_method`, then its `default_source`, then the customer's `invoice_settings.default_payment_method`, then the customer's `default_source`. A customer who replaces an expired card in the customer portal is picked up automatically, because the portal sets a new customer default (and clears the subscription-level override if there was one). If none of the four is set, the script falls back to the customer's most recently created card and prints a warning with the count — check those rows. It also warns separately about subscriptions billed against a legacy `card_...`/`src_...` source rather than a PaymentMethod, as Paddle may not accept those tokens.
 - If a customer has a **newer card on file than the one being billed**, the script exports the billed card and lists the subscription, customer, exported token and newer token so you can check it. This usually means the customer added a card without making it the default, or a subscription-level override was left pointing at the old card after they updated their details — in both cases Stripe keeps charging the old card, so that is what gets migrated unless you change it in Stripe first.

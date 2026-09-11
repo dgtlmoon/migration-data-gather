@@ -27,7 +27,7 @@ This collection of scripts  is designed to gather subscription and customer data
 
 ### Use a dedicated key for the migration
 
-Don't reuse an existing application/secret key for this. Create a **restricted API key** (starts with `rk_live_`) in the Stripe Dashboard under [Developers > API keys](https://dashboard.stripe.com/apikeys) > **Create restricted key**, named something obvious like `paddle-migration-export`, and give it **only the read permissions listed below**. A dedicated key means:
+Don't reuse an existing application/secret key for this. Create a **restricted API key** (starts with `rk_live_`) — [dashboard.stripe.com/apikeys/create](https://dashboard.stripe.com/apikeys/create) opens the form directly — named something obvious like `paddle-migration-export`, and give it **only the read permissions listed below**. A dedicated key means:
 
 - The key can only read data — it can never create charges, refunds, or modify your subscribers, even if it leaks.
 - You can see exactly which API calls this migration made via **⋯ > View request logs** on that key.
@@ -52,6 +52,7 @@ Notes:
 - Permission names and groupings differ slightly between Dashboard versions (for example, **Prices** may sit under the Billing group, **Payment Methods** under Core). If a call fails, Stripe returns a `403` whose error message names the exact permission to add — and you can check the key's request logs to see which endpoint was rejected.
 - Customer tax IDs are covered by **Customers: Read**. If your Dashboard exposes a separate **Tax IDs** resource, enable that as Read too.
 - `prices-discounts-mapping.py` does not talk to Stripe at all — it only reads the CSV files — so it needs no key.
+- Unlike GitHub's `?scopes=` links, Stripe has no supported way to pre-tick permissions from a URL. Prefilling them with `?permissions[0]=rak_..._read` worked unofficially for years and integrations relied on it, but the create-key flow was reworked and it can no longer be counted on. Tick the five boxes above by hand, or use the **preconfigured set of permissions** option in the create dialog and then remove what you don't need.
 
 ### Live mode vs sandbox
 
@@ -68,8 +69,31 @@ The data you migrate is live data, so the key must be a **live mode** key. If yo
 1. Clone the repository.
 2. Install the required packages:
    ```sh
-   pip3 install stripe python-dotenv
+   pip3 install -r requirements.txt python-dotenv
    ```
+
+## Stripe library and API version
+
+`stripe-python` pins an API version inside each release and sends it with every request, so **the installed library decides the shape of the response** — the API version set on your Stripe account's Dashboard does not apply here:
+
+| stripe-python | API version it sends |
+| --- | --- |
+| 9.x | `2024-04-10` |
+| 10.x | `2024-06-20` |
+| 11.x | `2024-09-30.acacia` → `2025-02-24.acacia` |
+| 12.x | `2025-03-31.basil` → `2025-08-27.basil` |
+| 13.x / 14.x | `2025-09-30.clover` → `2025-11-17.clover` |
+| 15.x | `2026-03-25.dahlia` → `2026-08-26.dahlia` |
+
+This matters because the fields the export depends on moved between those versions: billing periods moved from the subscription to its items in basil, `subscription.discount` became the `subscription.discounts` list, and `discount.coupon` became `discount.source.coupon` in clover. The script handles the basil and clover/dahlia shapes, and `requirements.txt` allows `stripe>=12.5,<16`.
+
+To keep runs reproducible regardless of which of those is installed, the script pins the API version explicitly:
+
+```python
+stripe.api_version = os.getenv('STRIPE_API_VERSION', '2025-08-27.basil')
+```
+
+Set `STRIPE_API_VERSION` in your `.env` if you need to export against a different one.
 
 ## Explanations of Each Script/File
 

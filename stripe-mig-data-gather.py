@@ -4,7 +4,7 @@ import csv
 import sys
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # Load environment variables from the .env file
@@ -12,6 +12,12 @@ load_dotenv()
 
 # Set your Stripe API key from the environment variable
 stripe.api_key = os.getenv('STRIPE_API_KEY')
+
+# stripe-python pins an API version per release, so the installed library - not the
+# account's Dashboard setting - decides the shape of the response. Pin it here instead so
+# that upgrading the library cannot quietly change the exported data. This is the version
+# the script was written against and tested on.
+stripe.api_version = os.getenv('STRIPE_API_VERSION', '2025-08-27.basil')
 
 def get_first_subscription_item(subscription):
     items = subscription['items'].data
@@ -31,10 +37,9 @@ def get_billing_interval(subscription):
     if first_item and first_item.price and first_item.price.recurring:
         return first_item.price.recurring.interval, first_item.price.recurring.interval_count
 
-    plan = getattr(subscription, 'plan', None)
-    if plan:
-        return plan.interval, plan.interval_count
-
+    # Nothing to fall back on: Subscription.plan was removed long before any API version
+    # this script supports, so an item without a recurring price is metered or one-off.
+    print(f"Warning: subscription {subscription.id} has no recurring price; assuming monthly billing.")
     return 'month', 1
 
 def get_subscription_discount(subscription):
@@ -82,7 +87,7 @@ def get_discount_coupon(discount):
 def format_timestamp(timestamp):
     if not timestamp:
         return ''
-    return datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%dT%H:%M:%SZ')
+    return datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 MAX_RATE_LIMIT_RETRIES = 6
 
@@ -186,7 +191,7 @@ def calculate_remaining_discount_cycles(subscription):
     if not coupon:
         return discount.id, ''
 
-    discount_start = datetime.utcfromtimestamp(discount.start)
+    discount_start = datetime.fromtimestamp(discount.start, timezone.utc)
     billing_interval, billing_interval_count = get_billing_interval(subscription)
 
     # Check if the discount is repeating or once
@@ -196,7 +201,7 @@ def calculate_remaining_discount_cycles(subscription):
     total_cycles = coupon.duration_in_months if coupon.duration == 'repeating' else 1
 
     # Calculate the number of billing cycles that have passed since the discount started
-    current_date = datetime.utcnow()
+    current_date = datetime.now(timezone.utc)
 
     if billing_interval == 'month':
         cycles_used = (current_date.year - discount_start.year) * 12 + (current_date.month - discount_start.month)
@@ -280,8 +285,8 @@ def fetch_stripe_subscriptions(limit=100):
             trial_period_frequency = ''
             trial_period_interval = ''
             if subscription.trial_end:
-                trial_end_date = datetime.utcfromtimestamp(subscription.trial_end)
-                current_date = datetime.utcnow()
+                trial_end_date = datetime.fromtimestamp(subscription.trial_end, timezone.utc)
+                current_date = datetime.now(timezone.utc)
                 time_left = trial_end_date - current_date
                 
                 if time_left.days >= 0:  # Check if there are days left

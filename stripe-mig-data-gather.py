@@ -1,6 +1,7 @@
 import os
 import stripe
 import csv
+import sys
 import time
 from datetime import datetime
 from dotenv import load_dotenv
@@ -82,22 +83,73 @@ def format_timestamp(timestamp):
         return ''
     return datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-# Function to fetch card token with backoff logic
-def fetch_card_token(customer_id):
+# Rows whose card_token needs a human look, reported at the end of the run
+_card_token_fallbacks = []
+_legacy_source_tokens = []
+_card_token_mismatches = []
+
+# Newest card per customer, so a customer with several subscriptions is only listed once
+_newest_card_cache = {}
+
+def _newest_card_id(customer_id):
+    """Most recently created card on the customer, or '' if they have none."""
+    if customer_id in _newest_card_cache:
+        return _newest_card_cache[customer_id]
+
+    newest = ''
     while True:
         try:
             payment_methods = stripe.PaymentMethod.list(customer=customer_id, type="card")
-            if payment_methods.data:
-                return payment_methods.data[0].id
-            else:
-                return ''
+            newest = payment_methods.data[0].id if payment_methods.data else ''
+            break
         except stripe.error.StripeError as e:
             if e.http_status == 429:  # Rate limit exceeded
                 print(f"Rate limit exceeded while fetching payment methods for customer {customer_id}. Retrying in 2 seconds...")
                 time.sleep(2)  # Wait for 2 seconds before retrying
                 continue
             print(f"Error fetching payment methods for customer {customer_id}: {e}")
-            return ''
+            break
+
+    _newest_card_cache[customer_id] = newest
+    return newest
+
+def _payment_method_id(candidate):
+    if isinstance(candidate, str):
+        return candidate
+    return getattr(candidate, 'id', '') if candidate else ''
+
+# Function to fetch card token with backoff logic
+def fetch_card_token(subscription, customer):
+    # Resolve the card in the same order Stripe itself bills in: a subscription-level
+    # default overrides the customer's, and the legacy source fields are the backstop.
+    # This follows a customer who replaces an expired card in the portal - that sets a new
+    # customer default, and clears the subscription override if they had one. Picking the
+    # newest card from PaymentMethod.list only looks right in that case by coincidence.
+    invoice_settings = getattr(customer, 'invoice_settings', None)
+    candidates = (
+        (getattr(subscription, 'default_payment_method', None), False),
+        (getattr(subscription, 'default_source', None), True),
+        (getattr(invoice_settings, 'default_payment_method', None), False),
+        (getattr(customer, 'default_source', None), True),
+    )
+    newest_card = _newest_card_id(customer.id)
+
+    for candidate, is_legacy_source in candidates:
+        payment_method_id = _payment_method_id(candidate)
+        if payment_method_id:
+            if is_legacy_source:
+                _legacy_source_tokens.append(customer.id)
+            # The default is what Stripe bills, so that is what gets exported. A newer
+            # card usually means the customer added one without making it the default -
+            # worth a look, because it can be a replacement that never took effect.
+            elif newest_card and newest_card != payment_method_id:
+                _card_token_mismatches.append((subscription.id, customer.id, payment_method_id, newest_card))
+            return payment_method_id
+
+    # No default anywhere: Stripe falls back to the customer's card, so do the same.
+    if newest_card:
+        _card_token_fallbacks.append(customer.id)
+    return newest_card
 
 # Function to fetch tax ID with backoff logic
 def fetch_tax_id(customer_id):
@@ -121,6 +173,11 @@ def calculate_remaining_discount_cycles(subscription):
     discount = get_subscription_discount(subscription)
     if not discount:
         return '', ''  # No discount applied
+
+    # Belt and braces: an unexpanded discount is just an ID string, and there is no
+    # endpoint to resolve one, so export the ID and leave the cycles for manual review.
+    if isinstance(discount, str):
+        return discount, ''
 
     coupon = get_discount_coupon(discount)
     if not coupon:
@@ -160,7 +217,12 @@ def fetch_stripe_subscriptions(limit=100):
     
     try:
         # Expand both 'customer' and 'items.data' in the subscription list call
-        subscriptions = stripe.Subscription.list(limit=limit, expand=["data.customer", "data.items.data.price", "data.items.data.discounts"])
+        # "data.discounts" must be expanded too: since API 2025-03-31 the subscription-level
+        # discounts are returned as a list of ID strings unless expanded.
+        subscriptions = stripe.Subscription.list(
+            limit=limit,
+            expand=["data.customer", "data.items.data.price", "data.items.data.discounts", "data.discounts"],
+        )
         
         for subscription in subscriptions.auto_paging_iter():
             # Skip subscriptions with status "past_due"
@@ -181,7 +243,7 @@ def fetch_stripe_subscriptions(limit=100):
             current_period_ends_at = format_timestamp(period_end)
             started_at = format_timestamp(subscription.start_date)
 
-            card_token = fetch_card_token(customer.id)
+            card_token = fetch_card_token(subscription, customer)
             business_tax_identifier = fetch_tax_id(customer.id)
             business_name = customer.name or ''
 
@@ -278,8 +340,29 @@ def fetch_stripe_subscriptions(limit=100):
             subscriptions_with_customers.append(subscription_data)
     
     except stripe.error.StripeError as e:
-        print(f"Error fetching data from Stripe: {e}")
-    
+        # Deliberately fatal: a short subscriber list that reports success is the worst
+        # possible outcome for a billing migration, so no CSV is written.
+        raise RuntimeError(
+            f"Stripe API error after {len(subscriptions_with_customers)} subscription(s): {e}"
+        ) from e
+
+    if _card_token_fallbacks:
+        print(f"Warning: {len(_card_token_fallbacks)} subscription(s) have no default payment method; "
+              f"card_token fell back to the customer's most recently created card. Verify these before import.")
+
+    if _legacy_source_tokens:
+        print(f"Warning: {len(_legacy_source_tokens)} subscription(s) are billed against a legacy source "
+              f"(card_... or src_...) rather than a PaymentMethod. Check with Paddle that these tokens can be imported.")
+
+    if _card_token_mismatches:
+        print(f"Warning: {len(_card_token_mismatches)} subscription(s) have a newer card on file than the one "
+              f"they are billed with. The billed card has been exported; check whether the newer card was meant "
+              f"to replace it:")
+        for subscription_id, customer_id, exported, newest in _card_token_mismatches[:20]:
+            print(f"  {subscription_id} ({customer_id}): exported {exported}, newest card {newest}")
+        if len(_card_token_mismatches) > 20:
+            print(f"  ... and {len(_card_token_mismatches) - 20} more")
+
     return subscriptions_with_customers
 
 # Function to export data to CSV
@@ -315,7 +398,12 @@ def export_to_csv(data, file_path='paddle_migration_output.csv'):
 
 # Main function to orchestrate the script
 def main():
-    subscriptions_data = fetch_stripe_subscriptions(limit=100)
+    try:
+        subscriptions_data = fetch_stripe_subscriptions(limit=100)
+    except RuntimeError as e:
+        print(f"{e}\nNo CSV was written. Resolve the error and re-run.")
+        sys.exit(1)
+
     export_to_csv(subscriptions_data)
     
     # Print success message
